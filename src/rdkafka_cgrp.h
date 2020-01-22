@@ -166,6 +166,13 @@ typedef struct rd_kafka_cgrp_s {
         rd_interval_t      rkcg_join_intvl;         /* JoinGroup interval */
         rd_interval_t      rkcg_timeout_scan_intvl; /* Timeout scanner */
 
+        rd_ts_t            rkcg_ts_session_timeout; /**< Absolute session
+                                                     *   timeout enforced by
+                                                     *   the consumer, this
+                                                     *   value is updated on
+                                                     *   Heartbeat success,
+                                                     *   etc. */
+
         TAILQ_HEAD(, rd_kafka_topic_s)  rkcg_topics;/* Topics subscribed to */
 
         rd_list_t          rkcg_toppars;            /* Toppars subscribed to*/
@@ -234,7 +241,7 @@ typedef struct rd_kafka_cgrp_s {
                                                         * last rebalance */
                 int                rebalance_cnt;      /* Number of
                                                           rebalances */
-                char               rebalance_reason[128]; /**< Last rebalance
+                char               rebalance_reason[256]; /**< Last rebalance
                                                            *   reason */
                 int                assignment_size;    /* Partition count
                                                         * of last rebalance

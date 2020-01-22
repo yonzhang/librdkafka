@@ -190,6 +190,22 @@ void rd_kafka_cgrp_destroy_final (rd_kafka_cgrp_t *rkcg) {
 
 
 
+/**
+ * @brief Update the absolute session timeout following a successfull
+ *        response from the coordinator.
+ *        This timeout is used to enforce the session timeout in the
+ *        consumer itself.
+ *
+ * @param reset if true the timeout is updated even if the session has expired.
+ */
+static RD_INLINE void
+rd_kafka_cgrp_update_session_timeout (rd_kafka_cgrp_t *rkcg, rd_bool_t reset) {
+        if (reset || rkcg->rkcg_ts_session_timeout != 0)
+                rkcg->rkcg_ts_session_timeout = rd_clock() +
+                        (rkcg->rkcg_rk->rk_conf.group_session_timeout_ms*1000);
+}
+
+
 
 rd_kafka_cgrp_t *rd_kafka_cgrp_new (rd_kafka_t *rk,
                                     const rd_kafkap_str_t *group_id,
@@ -1429,6 +1445,10 @@ void rd_kafka_cgrp_handle_Heartbeat (rd_kafka_t *rk,
                 rd_kafka_buf_read_throttle_time(rkbuf);
 
         rd_kafka_buf_read_i16(rkbuf, &ErrorCode);
+
+        if (!ErrorCode)
+                rd_kafka_cgrp_update_session_timeout(
+                        rkcg, rd_false/*dont update if session has expired*/);
 
 err:
         actions = rd_kafka_err_action(rkb, ErrorCode, request,
@@ -3186,9 +3206,47 @@ rd_kafka_cgrp_op_serve (rd_kafka_t *rk, rd_kafka_q_t *rkq,
 
 
 /**
+ * @returns true if the session timeout has expired (due to no successful
+ *          Heartbeats in session.timeout.ms) and triggers a rebalance.
+ */
+static rd_bool_t
+rd_kafka_cgrp_session_timeout_check (rd_kafka_cgrp_t *rkcg, rd_ts_t now) {
+        rd_ts_t delta;
+        char buf[256];
+
+        if (unlikely(!rkcg->rkcg_ts_session_timeout))
+                return rd_true; /* Session has expired */
+
+        delta = now - rkcg->rkcg_ts_session_timeout;
+        if (likely(delta < 0))
+                return rd_false;
+
+        delta += rkcg->rkcg_rk->rk_conf.group_session_timeout_ms * 1000;
+
+        rd_snprintf(buf, sizeof(buf),
+                    "Consumer group session timed out (in join-state %s) after "
+                    "%"PRId64" ms without a successful response from the "
+                    "group coordinator (broker %"PRId32")",
+                    rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
+                    delta/1000, rkcg->rkcg_coord_id);
+
+        rd_kafka_log(rkcg->rkcg_rk, LOG_WARNING, "SESSTMOUT",
+                     "%s: revoking assignment and rejoining group", buf);
+
+        /* Prevent further rebalances */
+        rkcg->rkcg_ts_session_timeout = 0;
+
+        rd_kafka_cgrp_rebalance(rkcg, buf);
+
+        return rd_true;
+}
+
+
+/**
  * Client group's join state handling
  */
 static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg) {
+        rd_ts_t now = rd_clock();
 
         if (unlikely(rd_kafka_fatal_error_code(rkcg->rkcg_rk)))
                 return;
@@ -3201,7 +3259,7 @@ static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg) {
                         break;
 
                 if (rd_interval_immediate(&rkcg->rkcg_join_intvl,
-					  1000*1000, 0) > 0)
+					  1000*1000, now) > 0)
                         rd_kafka_cgrp_join(rkcg);
                 break;
 
@@ -3211,14 +3269,17 @@ static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg) {
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN:
 		break;
 
-        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB:
-        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB:
         case RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED:
 	case RD_KAFKA_CGRP_JOIN_STATE_STARTED:
+                if (rd_kafka_cgrp_session_timeout_check(rkcg, now))
+                        return;
+                /* FALLTHRU */
+        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB:
+        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB:
                 if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_SUBSCRIPTION &&
                     rd_interval(&rkcg->rkcg_heartbeat_intvl,
                                 rkcg->rkcg_rk->rk_conf.
-                                group_heartbeat_intvl_ms * 1000, 0) > 0)
+                                group_heartbeat_intvl_ms * 1000, now) > 0)
                         rd_kafka_cgrp_heartbeat(rkcg);
                 break;
         }
@@ -3514,6 +3575,8 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
         rd_kafka_buf_read_bytes(rkbuf, &UserData);
 
  done:
+        rd_kafka_cgrp_update_session_timeout(rkcg, rd_true/*reset timeout*/);
+
         /* Set the new assignment */
 	rd_kafka_cgrp_handle_assignment(rkcg, assignment);
 
